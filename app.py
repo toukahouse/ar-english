@@ -4,12 +4,16 @@ import base64
 import tempfile
 from flask import Flask, request, jsonify, send_file
 from dotenv import load_dotenv
-from google import genai  # pakai Google Gemini API terbaru
 from PIL import Image
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from gtts import gTTS
 from io import BytesIO
+
+# --- GANTI BAGIAN IMPORT ---
+import vertexai 
+from vertexai.generative_models import GenerativeModel, Part, FinishReason
+from vertexai.language_models import TextGenerationModel # buat text-only kalau perlu
 
 # Muat variabel dari file .env
 load_dotenv()
@@ -17,14 +21,20 @@ load_dotenv()
 # Inisialisasi aplikasi Flask
 app = Flask(__name__)
 
-# --- BAGIAN BARU 1: KONFIGURASI GEMINI (genai terbaru) ---
-# Inisialisasi Client Gemini dengan API Key dari environment variable
-client = None
+# --- BAGIAN BARU: KONFIGURASI VERTEX AI ---
 try:
-    client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-    print("Koneksi ke Gemini API (genai) berhasil dikonfigurasi.")
+    # GANTI "gemini-new-api-id-kamu" dengan ID project kamu
+    # GANTI "us-central1" dengan region kamu (us-central1 biasanya default)
+    PROJECT_ID = "gemininewapi" # <-- GANTI INI
+    LOCATION = "global" # <-- GANTI INI
+    vertexai.init(project=PROJECT_ID, location=LOCATION)
+    
+    # Kita akan buat modelnya nanti pas dipakai, jadi 'client' bisa dikosongin
+    client = True # Anggap aja 'True' sebagai tanda siap
+    print(f"Koneksi ke VERTEX AI (Project: {PROJECT_ID}) berhasil dikonfigurasi.")
 except Exception as e:
-    print(f"Error konfigurasi Gemini API (genai): {e}")
+    client = False
+    print(f"Error konfigurasi Vertex AI: {e}")
 # -----------------------------------------------------------
 
 def get_db_connection():
@@ -109,9 +119,8 @@ def identifikasi_objek():
         return jsonify({"status": "gagal", "pesan": "Request harus berisi file atau JSON image_base64"}), 400
     
     try:
-        if client is None:
-            return jsonify({"status": "gagal", "pesan": "Client Gemini belum terinisialisasi"}), 500
-
+        if client is False:
+            return jsonify({"status": "gagal", "pesan": "Client Vertex AI belum terinisialisasi"}), 500
         # 3. Siapkan prompt (tetap sama seperti sebelumnya)
         prompt = """
         Kamu adalah API backend untuk sebuah aplikasi edukasi AR Bahasa Inggris.
@@ -127,34 +136,42 @@ def identifikasi_objek():
         """
 
         # 4. Upload gambar ke Gemini Files, lalu minta model memproses (API genai terbaru)
-        print("Mengupload gambar ke Gemini Files...")
-        tmp_path = None
-        try:
-            # Simpan gambar sementara sebagai JPEG agar konsisten
-            if image.mode in ("RGBA", "P"):
-                image = image.convert("RGB")
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
-                image.save(tmp, format="JPEG")
-                tmp_path = tmp.name
+        print("Mempersiapkan gambar untuk Vertex AI...")
 
-            uploaded_file_ref = client.files.upload(file=tmp_path)
-        finally:
-            # Hapus file temp kalau sudah ada
-            if tmp_path and os.path.exists(tmp_path):
-                try:
-                    os.remove(tmp_path)
-                except Exception:
-                    pass
+        # Ubah gambar PIL kamu jadi 'bytes' mentah
+        img_byte_arr = io.BytesIO()
+        if image.mode in ("RGBA", "P"):
+            image = image.convert("RGB")
+        image.save(img_byte_arr, format='JPEG')
+        image_bytes = img_byte_arr.getvalue()
 
-        print("Mengirim request ke Gemini (models.generate_content)...")
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=[uploaded_file_ref, prompt],
+        # Buat "Part" gambar
+        image_part = Part.from_data(
+            data=image_bytes,
+            mime_type="image/jpeg"
         )
-        print("Menerima response dari Gemini.")
-
-        # 5. Ambil nama objek dari jawaban Gemini dan rapikan
-        object_name = (response.text or "").strip().lower()
+        
+        # 5. Inisialisasi model & kirim request
+        print("Mengirim request ke Vertex AI (gemini-2.5-flash)...")
+        # Kita pakai model 'pro' atau 'flash' yang support vision
+        model = GenerativeModel("gemini-2.5-flash") 
+        
+        # Kirim GABUNGAN [gambar, teks_prompt]
+        response = model.generate_content(
+            [image_part, prompt], # Kirim sebagai list
+            generation_config={
+                "max_output_tokens": 32, # Jawabanmu pendek, 32 cukup
+                "temperature": 0.1,
+            }
+        )
+        print("Menerima response dari Vertex AI.")
+        
+        # 6. Ambil nama objek (cara ngambilnya sama kayak di atas)
+        object_name = ""
+        if response.candidates and response.candidates[0].content.parts:
+            object_name = response.candidates[0].content.parts[0].text
+        
+        object_name = object_name.strip().lower()
         if object_name and object_name != "unknown":
             try:
                 conn = get_db_connection()
@@ -269,13 +286,28 @@ def tanya_ai():
             'Unknown means something we do not know.'
             """
 
-        print(f"Mengirim pertanyaan tentang '{object_name}' ke Gemini...")
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt,
+        print(f"Mengirim pertanyaan tentang '{object_name}' ke Vertex AI...")
+        
+        # 1. Inisialisasi model
+        # Model 'gemini-2.5-flash' itu gak ada di Vertex,
+        # kita pakai 'gemini-1.5-flash-001' yang lebih baru
+        model = GenerativeModel("gemini-2.5-flash") 
+        
+        # 2. Kirim request
+        response = model.generate_content(
+            prompt,
+            generation_config={
+                "max_output_tokens": 256,
+                "temperature": 0.8, # Biar jawabannya konsisten
+            },
         )
-        print("Menerima jawaban dari Gemini.")
-        jawaban_ai = (response.text or "").strip()
+        print("Menerima jawaban dari Vertex AI.")
+        # 3. Ambil teksnya (cara ngambilnya sedikit beda)
+        jawaban_ai = ""
+        if response.candidates and response.candidates[0].content.parts:
+            jawaban_ai = response.candidates[0].content.parts[0].text
+        
+        jawaban_ai = jawaban_ai.strip()
 
         # --- BAGIAN BARU: SIMPAN JAWABAN BARU KE DATABASE ---
         try:
